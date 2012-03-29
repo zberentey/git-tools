@@ -17,6 +17,11 @@ Options:
 		git config setting. This can be either a remote name or a full
 		repository name (user/repo).
 
+	-t <title tags>
+		Comma separated list of tags that should be inserted into the title of
+		the pull request. The tags will be prefixed and suffixed according to
+		the 'title-tag-prefix' and 'title-tag-suffix' options.
+
 	-u <reviewer>, --reviewer <reviewer>
 		Send pull requests to this github repo instead of the 'remote upstream'
 		or 'github.reviewer' git config setting. This can be either a username
@@ -111,6 +116,7 @@ import getopt
 import json
 import os
 import re
+import smtplib
 import sys
 import urllib
 import urllib2
@@ -126,9 +132,18 @@ import urllib2
 #socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "localhost", 8181)
 #socket.socket = socks.socksocket
 
+from email.mime.text import MIMEText
+from string import join, split, strip
 from textwrap import fill
 
 options = {
+	# Determines if an empty pull request body is allowed
+	'allow-empty-body': True,
+
+	# Sets a list of git-hub users to be notified (inserts their user names
+	# into the body of the pull request in the form of @username)
+	'auto-send-notification-to': None,
+
 	# Color Scheme
 	'color-success': 'green',
 	'color-status': 'blue',
@@ -149,6 +164,9 @@ options = {
 	# Sets the default comment to post when closing a pull request.
 	'close-default-comment': None,
 
+	# The user's email credentials
+	'email-credentials': None,
+
 	# Determines whether fetch will automatically checkout the new branch.
 	'fetch-auto-checkout': False,
 
@@ -160,12 +178,26 @@ options = {
 	# Whether to show pull requests for the entire repo or just the update-branch.
 	'filter-by-update-branch': True,
 
+	# Sets the prefix to use when building the local branch name that a pull
+	# request should be fetched into.
+	'local-branch-prefix': 'pull-request',
+
+	# Sets the mail server and port to be used for notifications
+	'mail-server': 'smtp.gmail.com',
+	'mail-port': 587,
+	'mail-use-ssl': False,
+	'mail-use-tls': True,
+
 	# Determines whether to automatically close pull requests after merging
 	# them.
 	'merge-auto-close': True,
 
 	# Sets the branch to use where updates are merged from or to.
 	'update-branch': 'master',
+
+	# Sets whether the scipt should store the user's email credentials in a
+	# slightly obfuscated way
+	'store-email-credentials': False,
 
 	# Sets the method to use when updating pull request branches with changes
 	# in the update-branch.
@@ -174,6 +206,11 @@ options = {
 
 	# Determines whether to open newly submitted pull requests on github
 	'submit-open-github': True,
+
+	# Sets the prefix and suffix to use for tags inserted into the pull
+	# request's title
+	'title-tag-prefix': '[',
+	'title-tag-suffix': ']',
 
 	# Sets a directory to be used for performing updates to prevent
 	# excessive rebuilding by IDE's. Warning: This directory will be hard reset
@@ -197,23 +234,41 @@ def build_branch_name(pull_request):
 
 	m = re.search("[A-Z]{3,}-\d+", ref)
 
-	branch_name = 'pull-request-%s' % request_id
+	branch_name = '%s-%s' % (options["local-branch-prefix"], request_id)
 
 	if m != None and m.group(0) != '':
 		branch_name = '%s-%s' % (branch_name, m.group(0))
 
+	m = re.search("\[TECHNICAL SUPPORT\]", pull_request['title'])
+
+	if m != None and m.group(0) != '':
+		branch_name = '%s-%s' % (branch_name, 'sup')
+
 	return branch_name
 
-def build_pull_request_title(branch_name):
+def build_pull_request_title(branch_name, pull_title, title_tags = []):
 	"""Returns the default title to use for a pull request for the branch with
 	the name"""
 
-	m = re.search("([A-Z]{3,}-\d+)", branch_name)
+	title = pull_title
 
-	if m is not None and m.group(1) != '':
-		return m.group(1)
+	if title == None or title == '':
+		title = branch_name
 
-	return branch_name
+		m = re.search("([A-Z]{3,}-\d+)", branch_name)
+
+		if m is not None and m.group(1) != '':
+			title = m.group(1)
+
+		m = re.search("-sup$", branch_name)
+
+		if m is not None and m.group(0) != '':
+			title = '%s [TECHNICAL SUPPORT]' % title
+
+	for tag in title_tags:
+		title = '%s %s%s%s' % (title, options['title-tag-prefix'], tag, options['title-tag-suffix'])
+
+	return title
 
 def chdir(dir):
 	f = open('/tmp/git-pull-request-chdir', 'wb')
@@ -505,7 +560,7 @@ def get_pr_stats(repo_name, pull_request_ID):
 		for pull_request in pull_requests:
 			get_pr_stats(repo_name, pull_request)
 
-def command_submit(repo_name, username, reviewer_repo_name = None, pull_body = None, pull_title = None, submitOpenGitHub = True):
+def command_submit(repo_name, username, reviewer_repo_name = None, pull_body = None, pull_title = None, title_tags = [], submitOpenGitHub = True):
 	"""Push the current branch and create a pull request to your github reviewer
 	(or upstream)"""
 
@@ -536,12 +591,19 @@ def command_submit(repo_name, username, reviewer_repo_name = None, pull_body = N
 	# pull[title] - The String title of the Pull Request (and the related Issue).
 	# pull[body] - The String body of the Pull Request.
 
-	if pull_title == None or pull_title == '':
-		pull_title = build_pull_request_title(branch_name)
+	pull_title = build_pull_request_title(branch_name, pull_title, title_tags)
 
 	if pull_body == None:
-		pull_body = ''
-		# pull_body = raw_input("Comment: ").strip()
+		if options['allow-empty-body']:
+			pull_body = ''
+		else:
+			pull_body = raw_input("Comment: ").strip()
+
+	if options['auto-send-notification-to']:
+		for receiver in split(options['auto-send-notification-to'], ','):
+			receiver_list = '%s, @%s' % (receiver_list, receiver.strip())
+
+		pull_body += '\nNotification sent to: %s' % (receiver_list.strip(', '))
 
 	params = {
 		'pull[base]': options['update-branch'],
@@ -561,6 +623,12 @@ def command_submit(repo_name, username, reviewer_repo_name = None, pull_body = N
 	print
 
 	print color_text("Pull request submitted", 'success')
+
+	notification_receivers = get_notification_receivers(pull_request)
+
+	if notification_receivers:
+		send_notification(pull_request, notification_receivers)
+
 	print
 	display_status()
 
@@ -685,7 +753,7 @@ def display_pull_request(pull_request):
 
 	# print json.dumps(pull_request,sort_keys=True, indent=4)
 	if pull_request.get('body').strip():
-		print fill(pull_request.get('body'), initial_indent="	", subsequent_indent="	", width=80)
+		print fill(pull_request.get('body'), initial_indent="	", subsequent_indent="	", width=80).encode("utf-8")
 
 	# print "   Created: %s" % date.strftime(isodate.parse_datetime( pull_request.get('issue_created_at')), "%B %d, %Y at %I:%M %p")
 	# print "   Created: %s" % pull_request.get('issue_created_at')
@@ -737,7 +805,7 @@ def get_current_branch_name(ensure_pull_request = True):
 	"""Returns the name of the current pull request branch"""
 	branch_name = os.popen('git rev-parse --abbrev-ref HEAD').read().strip()
 
-	if ensure_pull_request and branch_name[0:13] != 'pull-request-':
+	if ensure_pull_request and not branch_name.startswith('pull-request') and not branch_name.startswith(options['local-branch-prefix']):
 		raise UserWarning("Invalid branch: not a pull request")
 
 	return branch_name
@@ -797,6 +865,9 @@ def get_work_dir():
 
 	return _work_dir
 
+def get_notification_receivers(pull_request):
+	return re.findall('[@](\w+)', pull_request.get('body'))
+
 def get_pull_request(repo_name, pull_request_ID):
 	"""Returns information retrieved from github about the pull request"""
 
@@ -825,7 +896,7 @@ def get_pull_requests(repo_name, filter_by_update_branch=False):
 def get_pull_request_ID(branch_name):
 	"""Returns the pull request number of the branch with the name"""
 
-	m = re.search("^pull-request-(\d+)", branch_name)
+	m = re.search("^(?:pull-request|%s)-(\d+)" % options['local-branch-prefix'], branch_name)
 
 	return int(m.group(1))
 
@@ -848,6 +919,14 @@ def get_repo_url(pull_request):
 		repo_url = repo_url.replace('git://github.com/', 'git@github.com:')
 
 	return repo_url
+
+def get_user_info(username):
+	"""Returns information about the user"""
+
+	url = "http://github.com/api/v2/json/user/show/%s" % (username)
+	data = github_json_request(url)
+
+	return data['user']
 
 def github_json_request(url, params = None, authenticate = True):
 	if params is not None:
@@ -926,7 +1005,7 @@ def load_users(filename):
 def main():
 	# parse command line options
 	try:
-		opts, args = getopt.gnu_getopt(sys.argv[1:], 'hqar:u:l:b:', ['help', 'quiet', 'all', 'repo=', 'reviewer=', 'update', 'no-update', 'user=', 'update-branch='])
+		opts, args = getopt.gnu_getopt(sys.argv[1:], 'hqar:u:l:b:t:', ['help', 'quiet', 'all', 'repo=', 'reviewer=', 'update', 'no-update', 'user=', 'update-branch=', 'tags='])
 	except getopt.GetoptError, e:
 		raise UserWarning("%s\nFor help use --help" % e)
 
@@ -944,6 +1023,7 @@ def main():
 
 	repo_name = None
 	reviewer_repo_name = None
+	title_tags = []
 
 	username = os.popen('git config github.user').read().strip()
 	auth_token = os.popen('git config github.token').read().strip()
@@ -999,6 +1079,10 @@ def main():
 			fetch_auto_update = True
 		elif o == '--no-update':
 			fetch_auto_update = False
+		elif o in ('-t', '--tags'):
+			title_tags = split(a, ',')
+			for i in range(len(title_tags)):
+				title_tags[i] = strip(title_tags[i])
 
 	# get repo name from git config
 	if repo_name is None or repo_name == '':
@@ -1054,7 +1138,7 @@ def main():
 			if len(args) >= 3:
 				pull_title = args[2]
 
-			command_submit(repo_name, username, reviewer_repo_name, pull_body, pull_title, submitOpenGitHub)
+			command_submit(repo_name, username, reviewer_repo_name, pull_body, pull_title, title_tags, submitOpenGitHub)
 		elif args[0] == 'update':
 			if len(args) >= 2:
 					command_update(repo_name, args[1])
@@ -1102,6 +1186,61 @@ def post_comment(repo_name, pull_request_ID, comment):
 	url = "http://github.com/api/v2/json/issues/comment/%s/%s" % (repo_name, pull_request_ID)
 	params = {'comment': comment}
 	github_json_request(url, params)
+
+def send_notification(pull_request, receivers):
+	user_name = pull_request['user'].get('name')
+	user_email = pull_request['user'].get('email')
+
+	reviewer_name = pull_request['base']['user'].get('name')
+
+	mail_user = None
+	mail_password = None
+
+	if options['email-credentials']:
+		credentials = base64.b64decode(options['email-credentials']).split(';',1)
+		mail_user = credentials[0]
+		mail_password = credentials[1]
+	else:
+		print "You have sent a pull request with one or more user tokens in it. In order to send a notification email to these users you need to enter your gmail username and password. To store this information in a slightly obfuscated way in your git configration, set store-email-credentials to true."
+		mail_user = raw_input("Enter you gmail username: ")
+		mail_password = raw_input("Enter you gmail password: ")
+
+		if options['store-email-credentials']:
+			encoded_credentials = base64.b64encode(mail_user + ';' + mail_password)
+			os.system('git config --global git-pull-request.email-credentials %s' % encoded_credentials)
+
+
+	email_addresses = []
+	for receiver in receivers:
+		email = get_user_info(receiver)['email']
+		if email is not None:
+			email_addresses.append(email)
+		else:
+			print "Warning! Couldn't find email address for %s" % receiver
+
+	message_body = "%s has just sent the following pull request to %s.\n\n%s\n\n---\nYou can view this pull request directly on GitHub:\n%s" % (user_name, reviewer_name, pull_request.get('body'), pull_request.get('html_url'))
+
+	msg = MIMEText(message_body, _charset='utf-8')
+	msg['Subject'] = '[%s] %s' % (pull_request['base']['repository'].get('name'), pull_request.get('title'))
+	msg['From'] = user_email
+	msg['To'] = join(email_addresses, ',')
+
+	server = None
+	mail_url = '%s:%i' % (options['mail-server'], options['mail-port'])
+
+	if options['mail-use-ssl']:
+		server = smtplib.SMTP_SSL(mail_url)
+	else:
+		server = smtplib.SMTP('smtp.gmail.com:587')
+
+	if options['mail-use-tls']:
+		server.starttls()
+
+	server.login(mail_user, mail_password)
+	server.sendmail(user_email, email_addresses, msg.as_string())
+	server.quit()
+
+	print "Notification sent to the following addresses: %s" % join(email_addresses, ',')
 
 def update_branch(branch_name):
 	if in_work_dir():
